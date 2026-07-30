@@ -2,6 +2,8 @@
 CONFIG_GPIO_ALTERA=y
 # Enable system id peripheral
 CONFIG_ALTERA_SYSID=y
+# Enable Altera mSGDMA driver
+CONFIG_ALTERA_MSGDMA=y
 # TSN phy support
 CONFIG_ADIN_PHY=y
 CONFIG_ADIN1100_PHY=y

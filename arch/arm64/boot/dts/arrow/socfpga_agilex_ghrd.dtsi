@@ -60,6 +60,16 @@
 				resetvalue = <7>;				
 		};
 		
+		msgdma_0: dma@28000400 {
+				compatible = "altr,socfpga-msgdma";
+				reg = <0x28000400 0x20>,   /* CSR */
+				      <0x28000420 0x10>;   /* Descriptor slave */
+				reg-names = "csr", "desc";
+				interrupt-parent = <&intc>;
+				interrupts = <0 19 4>;
+				#dma-cells = <1>;
+		};
+
 		led_pio3: gpio@28000060 {
 				status = "okay";
 				compatible = "altr,pio-1.0";
