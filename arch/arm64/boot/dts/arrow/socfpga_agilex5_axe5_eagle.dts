@@ -43,6 +43,34 @@
 		device_type = "memory";
 		/* We expect the bootloader to fill in the reg */
 		reg = <0x0 0x0 0x0 0x0>;
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		/*
+		 * Three fixed 64 MiB buffers in HPS DDR for FPGA writes via F2SDRAM.
+		 * Placed at 0x8e00_0000 and above to avoid kernel code/data regions.
+		 */
+		fpga_dma_buf0: buffer@8e000000 {
+            compatible = "shared-dma-pool";
+			reg = <0x0 0x8e000000 0x0 0x04000000>;
+			no-map;
+		};
+
+		fpga_dma_buf1: buffer@92000000 {
+            compatible = "shared-dma-pool";
+			reg = <0x0 0x92000000 0x0 0x04000000>;
+			no-map;
+		};
+
+		fpga_dma_buf2: buffer@96000000 {
+            compatible = "shared-dma-pool";
+			reg = <0x0 0x96000000 0x0 0x04000000>;
+			no-map;
+		};
 	};	
 };	
 
