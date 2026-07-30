@@ -63,8 +63,9 @@
 		msgdma_0: dma@28000400 {
 				compatible = "altr,socfpga-msgdma";
 				reg = <0x28000400 0x20>,   /* CSR */
-				      <0x28000420 0x10>;   /* Descriptor slave */
-				reg-names = "csr", "desc";
+				      <0x28000420 0x10>,   /* Descriptor slave */
+				      <0x28000430 0x08>;   /* Response slave */
+				reg-names = "csr", "desc", "resp";
 				interrupt-parent = <&intc>;
 				interrupts = <0 19 4>;
 				#dma-cells = <1>;
