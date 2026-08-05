@@ -20,3 +20,6 @@ CONFIG_FAT_FS=y
 CONFIG_NTFS3_FS=y
 CONFIG_EXFAT_FS=y
 CONFIG_EXT4_FS=y
+# Allow /dev/mem access to normal RAM (needed for cached DMA buffer mmap
+# when reserved-memory nodes have no-map removed from the DTS).
+# CONFIG_STRICT_DEVMEM is not set

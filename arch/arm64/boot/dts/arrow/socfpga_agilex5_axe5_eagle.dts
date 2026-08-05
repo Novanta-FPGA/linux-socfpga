@@ -54,22 +54,24 @@
 		 * Three fixed 64 MiB buffers in HPS DDR for FPGA writes via F2SDRAM.
 		 * Placed at 0x8e00_0000 and above to avoid kernel code/data regions.
 		 */
+		/*
+		 * no-map absent + CONFIG_STRICT_DEVMEM=n:
+		 *   pfn_is_map_memory() = true  → /dev/mem maps as write-back cached.
+		 *   Full DDR read bandwidth from userspace (< 1 ms for 921 KB).
+		 */
 		fpga_dma_buf0: buffer@8e000000 {
-            compatible = "shared-dma-pool";
+			compatible = "shared-dma-pool";
 			reg = <0x0 0x8e000000 0x0 0x04000000>;
-			no-map;
 		};
 
 		fpga_dma_buf1: buffer@92000000 {
-            compatible = "shared-dma-pool";
+			compatible = "shared-dma-pool";
 			reg = <0x0 0x92000000 0x0 0x04000000>;
-			no-map;
 		};
 
 		fpga_dma_buf2: buffer@96000000 {
-            compatible = "shared-dma-pool";
+			compatible = "shared-dma-pool";
 			reg = <0x0 0x96000000 0x0 0x04000000>;
-			no-map;
 		};
 	};	
 };	
