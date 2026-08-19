@@ -15,6 +15,15 @@ CONFIG_USB_NET_AX88179_178A=y
 CONFIG_USB_NET_CDC_EEM=y
 CONFIG_USB_NET_CDC_NCM=y
 CONFIG_USB_NET_CDC_MBIM=y
+# Realtek RTL8152/8153/8156 vendor driver: NOT used. Switching the RTL8156
+# 2.5G USB adapter from the generic cdc_ncm driver to this dedicated r8152
+# driver caused a severe TX throughput regression (~60k pkts/s down to
+# ~40-52k pkts/s) due to r8152's small/fixed USB TX aggregation buffer pool
+# and its tasklet-deferred (softirq) TX submission path, which stalls under
+# CPU contention with the streaming app. Increasing RTL8152_MAX_TX/agg_buf_sz
+# in r8152.c only partially recovered throughput, still short of cdc_ncm.
+# Staying on cdc_ncm (CONFIG_USB_NET_CDC_NCM above) instead.
+CONFIG_USB_RTL8152=n
 # Enable NTFS and FAT file support
 CONFIG_FAT_FS=y
 CONFIG_NTFS3_FS=y
@@ -23,3 +32,5 @@ CONFIG_EXT4_FS=y
 # Allow /dev/mem access to normal RAM (needed for cached DMA buffer mmap
 # when reserved-memory nodes have no-map removed from the DTS).
 # CONFIG_STRICT_DEVMEM is not set
+# AF_XDP zero-copy TX/RX sockets (for xdp_tx_bench experiment)
+CONFIG_XDP_SOCKETS=y
