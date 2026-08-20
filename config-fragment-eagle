@@ -10,11 +10,24 @@ CONFIG_UIO_PDRV_GENIRQ=y
 CONFIG_ADIN_PHY=y
 CONFIG_ADIN1100_PHY=y
 # USB Network drivers
-CONFIG_USB_USBNET=y
-CONFIG_USB_NET_AX88179_178A=y
-CONFIG_USB_NET_CDC_EEM=y
-CONFIG_USB_NET_CDC_NCM=y
-CONFIG_USB_NET_CDC_MBIM=y
+# USB_USBNET is =m (not =y): this lets us reload the usbnet core itself
+# (usbnet.ko) via rmmod/modprobe during development without a full
+# kernel image rebuild + reboot cycle. Since a tristate symbol can't be
+# =y when something it depends on is =m, USB_NET_CDC_EEM must also drop
+# to =m here (it would otherwise get silently capped to =m by
+# "make oldconfig" anyway).
+CONFIG_USB_USBNET=m
+# ax88179_178a disabled: on our actual hardware the AX88179-branded dongle
+# enumerates as a standard CDC-NCM class device and binds to cdc_ncm.c
+# anyway (confirmed via "lsusb -t" showing Driver=cdc_ncm for it), so the
+# vendor driver never gets a chance to claim it. CDC_MBIM must stay =m
+# (not =y): it depends on CDC_NCM, and a built-in driver cannot depend
+# on a loadable module, so leaving CDC_MBIM=y silently forces CDC_NCM
+# back to =y via "make oldconfig" (this happened once already).
+# CONFIG_USB_NET_AX88179_178A is not set
+CONFIG_USB_NET_CDC_EEM=m
+CONFIG_USB_NET_CDC_NCM=m
+CONFIG_USB_NET_CDC_MBIM=m
 # Realtek RTL8152/8153/8156 vendor driver: NOT used. Switching the RTL8156
 # 2.5G USB adapter from the generic cdc_ncm driver to this dedicated r8152
 # driver caused a severe TX throughput regression (~60k pkts/s down to

@@ -30,6 +30,15 @@
 #include <linux/slab.h>
 #include <linux/kernel.h>
 #include <linux/pm_runtime.h>
+#include <linux/dmapool.h>
+#include <linux/delay.h>
+#include <linux/vmalloc.h>
+#include <net/xdp_sock_drv.h>
+
+/* AF_XDP zero-copy TX support, implemented further below; forward declared
+ * here so usbnet_disconnect() can tear down a still-bound xsk pool.
+ */
+static void usbnet_xsk_pool_disable(struct usbnet *dev);
 
 /*-------------------------------------------------------------------------*/
 
@@ -1659,6 +1668,8 @@ void usbnet_disconnect (struct usb_interface *intf)
 	net = dev->net;
 	unregister_netdev (net);
 
+	usbnet_xsk_pool_disable(dev);
+
 	cancel_work_sync(&dev->kevent);
 
 	while ((urb = usb_get_from_anchor(&dev->deferred))) {
@@ -1678,6 +1689,394 @@ void usbnet_disconnect (struct usb_interface *intf)
 }
 EXPORT_SYMBOL_GPL(usbnet_disconnect);
 
+/*-------------------------------------------------------------------------*/
+
+/* AF_XDP zero-copy TX support. See struct usbnet_xsk_ops in usbnet.h for
+ * the split of responsibility between this generic core and a minidriver's
+ * framing-specific tx_build()/get_limits() callbacks.
+ *
+ * At most USBNET_XSK_TX_INFLIGHT_MAX zero-copy URBs are kept outstanding at
+ * once; usbnet_xsk_tx_drain() is invoked both from ndo_xsk_wakeup() and from
+ * each zero-copy URB completion, so the pipeline keeps refilling itself
+ * under sustained load without requiring the application to keep kicking it.
+ */
+#define USBNET_XSK_TX_INFLIGHT_MAX 4
+
+/* per-URB completion context for the zero-copy xsk TX path */
+struct usbnet_xsk_tx_urb_ctx {
+	struct usbnet		*dev;
+	struct scatterlist	*sg;
+	void			*hdr_buf;
+	dma_addr_t		hdr_buf_dma;
+	unsigned int		n_frames;
+};
+
+static void usbnet_xsk_tx_drain(struct usbnet *dev);
+
+static void usbnet_xsk_tx_complete(struct urb *urb)
+{
+	struct usbnet_xsk_tx_urb_ctx *ctx = urb->context;
+	struct usbnet *dev = ctx->dev;
+	unsigned long flags;
+
+	if (urb->status)
+		netif_dbg(dev, tx_err, dev->net, "xsk tx err %d\n", urb->status);
+
+	xsk_tx_completed(dev->xsk_pool, ctx->n_frames);
+	usb_autopm_put_interface_async(dev->intf);
+
+	dma_pool_free(dev->xsk_hdr_pool, ctx->hdr_buf, ctx->hdr_buf_dma);
+	kfree(ctx->sg);
+	kfree(ctx);
+	usb_free_urb(urb);
+
+	atomic_dec(&dev->xsk_tx_inflight);
+
+	if (netif_running(dev->net) && dev->xsk_pool) {
+		spin_lock_irqsave(&dev->xsk_tx_lock, flags);
+		usbnet_xsk_tx_drain(dev);
+		spin_unlock_irqrestore(&dev->xsk_tx_lock, flags);
+	}
+}
+
+/* Must be called with dev->xsk_tx_lock held. */
+static void usbnet_xsk_tx_drain(struct usbnet *dev)
+{
+	const struct usbnet_xsk_ops *xsk_ops = dev->driver_info->xsk_ops;
+	struct xsk_buff_pool *pool = dev->xsk_pool;
+
+	if (!pool)
+		return;
+
+	while (atomic_read(&dev->xsk_tx_inflight) < USBNET_XSK_TX_INFLIGHT_MAX) {
+		struct usbnet_xsk_tx_urb_ctx *ctx;
+		struct usbnet_xsk_tx_ctx tx = { };
+		struct xdp_desc desc;
+		struct scatterlist *sg;
+		struct urb *urb;
+		unsigned int n = 0, nsg = 0, total_len = 0, budget = 0;
+		dma_addr_t dma_addr;
+		void *hdr_buf;
+		dma_addr_t hdr_buf_dma;
+		int ret;
+
+		if (dev->xsk_tx_have_spill) {
+			dev->xsk_tx_dma[n] = dev->xsk_tx_spill_dma;
+			dev->xsk_tx_len[n] = dev->xsk_tx_spill_len;
+			dev->xsk_tx_page[n] = dev->xsk_tx_spill_page;
+			dev->xsk_tx_off[n] = dev->xsk_tx_spill_off;
+			budget += dev->xsk_tx_spill_len;
+			dev->xsk_tx_have_spill = false;
+			n++;
+		}
+
+		while (n < dev->xsk_max_frames) {
+			struct page *page;
+			unsigned int off;
+			void *va;
+
+			if (!xsk_tx_peek_desc(pool, &desc))
+				break;
+
+			dma_addr = xsk_buff_raw_get_dma(pool, desc.addr);
+			xsk_buff_raw_dma_sync_for_device(pool, dma_addr, desc.len);
+
+			/* UMEM is vmap()'d (see xdp_umem_addr_map()), so
+			 * virt_to_page() doesn't apply; resolve the backing
+			 * struct page via the page tables instead. Needed so
+			 * sg_page() is valid: some USB host controllers (xhci)
+			 * copy through a bounce buffer via sg_pcopy_to_buffer()
+			 * when a TD isn't aligned to the endpoint's max packet
+			 * size, and silently copy zero bytes (corrupting the
+			 * transfer) if the sg entry has no real page behind it.
+			 */
+			va = xsk_buff_raw_get_data(pool, desc.addr);
+			page = vmalloc_to_page(va);
+			off = offset_in_page(va);
+
+			if (n > 0 && budget + desc.len > dev->xsk_max_tx_size) {
+				/* doesn't fit in this transfer; carry it over
+				 * to the next one (cannot "unpeek" it).
+				 */
+				dev->xsk_tx_spill_dma = dma_addr;
+				dev->xsk_tx_spill_len = desc.len;
+				dev->xsk_tx_spill_page = page;
+				dev->xsk_tx_spill_off = off;
+				dev->xsk_tx_have_spill = true;
+				break;
+			}
+
+			dev->xsk_tx_dma[n] = dma_addr;
+			dev->xsk_tx_len[n] = desc.len;
+			dev->xsk_tx_page[n] = page;
+			dev->xsk_tx_off[n] = off;
+			budget += desc.len;
+			n++;
+		}
+
+		if (n == 0) {
+			xsk_set_tx_need_wakeup(pool);
+			break;
+		}
+
+		sg = kmalloc_array(dev->xsk_sg_max, sizeof(*sg), GFP_ATOMIC);
+		if (!sg) {
+			xsk_tx_completed(pool, n);
+			dev->net->stats.tx_dropped += n;
+			break;
+		}
+		sg_init_table(sg, dev->xsk_sg_max);
+
+		hdr_buf = dma_pool_alloc(dev->xsk_hdr_pool, GFP_ATOMIC, &hdr_buf_dma);
+		if (!hdr_buf) {
+			kfree(sg);
+			xsk_tx_completed(pool, n);
+			dev->net->stats.tx_dropped += n;
+			break;
+		}
+
+		tx.sg = sg;
+		tx.sg_max = dev->xsk_sg_max;
+		tx.hdr_buf = hdr_buf;
+		tx.hdr_buf_dma = hdr_buf_dma;
+		tx.hdr_buf_size = dev->xsk_hdr_size;
+		tx.pad_buf = dev->xsk_pad_buf;
+		tx.pad_buf_dma = dev->xsk_pad_buf_dma;
+		tx.pad_buf_size = dev->xsk_pad_buf_size;
+
+		ret = xsk_ops->tx_build(dev, &tx, dev->xsk_tx_dma, dev->xsk_tx_page,
+					 dev->xsk_tx_off, dev->xsk_tx_len,
+					 n, &nsg, &total_len);
+		if (ret <= 0) {
+			dma_pool_free(dev->xsk_hdr_pool, hdr_buf, hdr_buf_dma);
+			kfree(sg);
+			xsk_tx_completed(pool, n);
+			dev->net->stats.tx_dropped += n;
+			break;
+		}
+		n = ret;
+
+		ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
+		urb = usb_alloc_urb(0, GFP_ATOMIC);
+		if (!ctx || !urb) {
+			kfree(ctx);
+			usb_free_urb(urb);
+			dma_pool_free(dev->xsk_hdr_pool, hdr_buf, hdr_buf_dma);
+			kfree(sg);
+			xsk_tx_completed(pool, n);
+			dev->net->stats.tx_dropped += n;
+			break;
+		}
+
+		ctx->dev = dev;
+		ctx->sg = sg;
+		ctx->hdr_buf = hdr_buf;
+		ctx->hdr_buf_dma = hdr_buf_dma;
+		ctx->n_frames = n;
+
+		usb_fill_bulk_urb(urb, dev->udev, dev->out, NULL, total_len,
+				   usbnet_xsk_tx_complete, ctx);
+		urb->sg = sg;
+		urb->num_sgs = nsg;
+		urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+
+		if (usb_autopm_get_interface_async(dev->intf)) {
+			usb_free_urb(urb);
+			kfree(ctx);
+			dma_pool_free(dev->xsk_hdr_pool, hdr_buf, hdr_buf_dma);
+			kfree(sg);
+			xsk_tx_completed(pool, n);
+			dev->net->stats.tx_dropped += n;
+			break;
+		}
+
+		ret = usb_submit_urb(urb, GFP_ATOMIC);
+		if (ret) {
+			netif_dbg(dev, tx_err, dev->net,
+				  "xsk tx: submit urb err %d\n", ret);
+			usb_autopm_put_interface_async(dev->intf);
+			usb_free_urb(urb);
+			kfree(ctx);
+			dma_pool_free(dev->xsk_hdr_pool, hdr_buf, hdr_buf_dma);
+			kfree(sg);
+			xsk_tx_completed(pool, n);
+			dev->net->stats.tx_dropped += n;
+			break;
+		}
+
+		/* Ownership of urb now belongs to the USB core until
+		 * usbnet_xsk_tx_complete() runs; it calls usb_free_urb().
+		 * Freeing it here too would be a double-free (this was a
+		 * real bug found via a hardware use-after-free/panic).
+		 */
+		atomic_inc(&dev->xsk_tx_inflight);
+	}
+}
+
+int usbnet_xsk_wakeup(struct net_device *net, u32 queue_id, u32 flags)
+{
+	struct usbnet *dev = netdev_priv(net);
+	unsigned long lock_flags;
+
+	if (!dev->xsk_pool || queue_id != 0)
+		return -EINVAL;
+
+	spin_lock_irqsave(&dev->xsk_tx_lock, lock_flags);
+	usbnet_xsk_tx_drain(dev);
+	spin_unlock_irqrestore(&dev->xsk_tx_lock, lock_flags);
+
+	return 0;
+}
+
+static void usbnet_xsk_pool_disable(struct usbnet *dev)
+{
+	struct xsk_buff_pool *pool = dev->xsk_pool;
+	unsigned long flags;
+
+	if (!pool)
+		return;
+
+	spin_lock_irqsave(&dev->xsk_tx_lock, flags);
+	dev->xsk_pool = NULL;
+	spin_unlock_irqrestore(&dev->xsk_tx_lock, flags);
+
+	/* wait out any zero-copy URBs still in flight before tearing down
+	 * the persistent DMA mapping and scratch buffers they reference.
+	 * Called from process context (ndo_bpf), so sleeping is fine.
+	 */
+	while (atomic_read(&dev->xsk_tx_inflight))
+		msleep(1);
+
+	xsk_pool_dma_unmap(pool, 0);
+
+	dma_pool_destroy(dev->xsk_hdr_pool);
+	dev->xsk_hdr_pool = NULL;
+
+	kfree(dev->xsk_tx_dma);
+	kfree(dev->xsk_tx_len);
+	kfree(dev->xsk_tx_page);
+	kfree(dev->xsk_tx_off);
+	dev->xsk_tx_dma = NULL;
+	dev->xsk_tx_len = NULL;
+	dev->xsk_tx_page = NULL;
+	dev->xsk_tx_off = NULL;
+
+	if (dev->xsk_pad_buf)
+		dma_free_coherent(dev->udev->bus->sysdev, dev->xsk_pad_buf_size,
+				   dev->xsk_pad_buf, dev->xsk_pad_buf_dma);
+	dev->xsk_pad_buf = NULL;
+	dev->xsk_pad_buf_size = 0;
+
+	dev->xsk_max_frames = 0;
+	dev->xsk_sg_max = 0;
+	dev->xsk_max_tx_size = 0;
+	dev->xsk_tx_have_spill = false;
+}
+
+static int usbnet_xsk_pool_enable(struct usbnet *dev, struct xsk_buff_pool *pool,
+				   u16 qid)
+{
+	const struct usbnet_xsk_ops *xsk_ops = dev->driver_info->xsk_ops;
+	struct usbnet_xsk_limits lim = { };
+	struct device *dma_dev = dev->udev->bus->sysdev;
+	int err;
+
+	if (!xsk_ops || !xsk_ops->get_limits || !xsk_ops->tx_build)
+		return -EOPNOTSUPP;
+	if (qid != 0)
+		return -EINVAL;
+	if (dev->xsk_pool)
+		return -EBUSY;
+
+	err = xsk_ops->get_limits(dev, &lim);
+	if (err)
+		return err;
+	if (!lim.max_frames || !lim.max_hdr_size || !lim.max_tx_size)
+		return -EINVAL;
+
+	err = xsk_pool_dma_map(pool, dma_dev, 0);
+	if (err)
+		return err;
+
+	dev->xsk_hdr_pool = dma_pool_create(dev->net->name, dma_dev,
+					     lim.max_hdr_size, 4, 0);
+	if (!dev->xsk_hdr_pool) {
+		err = -ENOMEM;
+		goto err_unmap;
+	}
+	dev->xsk_hdr_size = lim.max_hdr_size;
+
+	dev->xsk_tx_dma = kmalloc_array(lim.max_frames, sizeof(*dev->xsk_tx_dma),
+					 GFP_KERNEL);
+	dev->xsk_tx_len = kmalloc_array(lim.max_frames, sizeof(*dev->xsk_tx_len),
+					 GFP_KERNEL);
+	dev->xsk_tx_page = kmalloc_array(lim.max_frames, sizeof(*dev->xsk_tx_page),
+					  GFP_KERNEL);
+	dev->xsk_tx_off = kmalloc_array(lim.max_frames, sizeof(*dev->xsk_tx_off),
+					 GFP_KERNEL);
+	if (!dev->xsk_tx_dma || !dev->xsk_tx_len || !dev->xsk_tx_page ||
+	    !dev->xsk_tx_off) {
+		err = -ENOMEM;
+		goto err_arrays;
+	}
+
+	if (lim.max_pad_size) {
+		dev->xsk_pad_buf = dma_alloc_coherent(dma_dev, lim.max_pad_size,
+						       &dev->xsk_pad_buf_dma,
+						       GFP_KERNEL);
+		if (!dev->xsk_pad_buf) {
+			err = -ENOMEM;
+			goto err_arrays;
+		}
+		dev->xsk_pad_buf_size = lim.max_pad_size;
+	}
+
+	/* header + (payload + pad) per frame + trailing pad/short-packet */
+	dev->xsk_sg_max = 1 + lim.max_frames * 2 + 1;
+	dev->xsk_max_frames = lim.max_frames;
+	dev->xsk_max_tx_size = lim.max_tx_size;
+	dev->xsk_tx_have_spill = false;
+	atomic_set(&dev->xsk_tx_inflight, 0);
+
+	/* xsk_pool must be set last: it's what enables ndo_xsk_wakeup */
+	dev->xsk_pool = pool;
+
+	return 0;
+
+err_arrays:
+	kfree(dev->xsk_tx_dma);
+	kfree(dev->xsk_tx_len);
+	kfree(dev->xsk_tx_page);
+	kfree(dev->xsk_tx_off);
+	dev->xsk_tx_dma = NULL;
+	dev->xsk_tx_len = NULL;
+	dev->xsk_tx_page = NULL;
+	dev->xsk_tx_off = NULL;
+	dma_pool_destroy(dev->xsk_hdr_pool);
+	dev->xsk_hdr_pool = NULL;
+err_unmap:
+	xsk_pool_dma_unmap(pool, 0);
+	return err;
+}
+
+int usbnet_ndo_bpf(struct net_device *net, struct netdev_bpf *bpf)
+{
+	struct usbnet *dev = netdev_priv(net);
+
+	switch (bpf->command) {
+	case XDP_SETUP_XSK_POOL:
+		if (bpf->xsk.pool)
+			return usbnet_xsk_pool_enable(dev, bpf->xsk.pool,
+						       bpf->xsk.queue_id);
+		usbnet_xsk_pool_disable(dev);
+		return 0;
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+EXPORT_SYMBOL_GPL(usbnet_ndo_bpf);
+EXPORT_SYMBOL_GPL(usbnet_xsk_wakeup);
+
 static const struct net_device_ops usbnet_netdev_ops = {
 	.ndo_open		= usbnet_open,
 	.ndo_stop		= usbnet_stop,
@@ -1687,6 +2086,8 @@ static const struct net_device_ops usbnet_netdev_ops = {
 	.ndo_change_mtu		= usbnet_change_mtu,
 	.ndo_set_mac_address 	= eth_mac_addr,
 	.ndo_validate_addr	= eth_validate_addr,
+	.ndo_bpf		= usbnet_ndo_bpf,
+	.ndo_xsk_wakeup		= usbnet_xsk_wakeup,
 };
 
 /*-------------------------------------------------------------------------*/
@@ -1761,6 +2162,8 @@ usbnet_probe (struct usb_interface *udev, const struct usb_device_id *prod)
 	init_usb_anchor(&dev->deferred);
 	timer_setup(&dev->delay, usbnet_bh, 0);
 	mutex_init (&dev->phy_mutex);
+	spin_lock_init(&dev->xsk_tx_lock);
+	atomic_set(&dev->xsk_tx_inflight, 0);
 	mutex_init(&dev->interrupt_mutex);
 	dev->interrupt_count = 0;
 
@@ -1778,6 +2181,17 @@ usbnet_probe (struct usb_interface *udev, const struct usb_device_id *prod)
 	net->watchdog_timeo = TX_TIMEOUT_JIFFIES;
 	net->ethtool_ops = &usbnet_ethtool_ops;
 	net->pcpu_stat_type = NETDEV_PCPU_STAT_TSTATS;
+
+	/* Advertise AF_XDP zero-copy TX capability so xp_assign_dev()'s
+	 * NETDEV_XDP_ACT_ZC gate accepts a forced XDP_ZEROCOPY bind. We
+	 * don't implement generic XDP_SETUP_PROG/redirect, but usbnet_ndo_bpf()
+	 * only ever handles XDP_SETUP_XSK_POOL, so this is safe: any attempt
+	 * to attach a real XDP program is rejected by the ndo_bpf handler.
+	 */
+	if (info->xsk_ops)
+		net->xdp_features = NETDEV_XDP_ACT_BASIC |
+				     NETDEV_XDP_ACT_REDIRECT |
+				     NETDEV_XDP_ACT_XSK_ZEROCOPY;
 
 	// allow device-specific bind/init procedures
 	// NOTE net->name still not usable ...

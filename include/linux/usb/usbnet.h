@@ -14,6 +14,83 @@
 #include <linux/skbuff.h>
 #include <linux/types.h>
 #include <linux/usb.h>
+#include <linux/spinlock.h>
+
+struct xsk_buff_pool;
+struct dma_pool;
+struct usbnet;
+
+/* AF_XDP zero-copy TX support (see usbnet_xsk_*() in usbnet.c).
+ *
+ * Minidrivers that can batch multiple AF_XDP TX descriptors into a single
+ * USB transfer (e.g. CDC NCM's NTB aggregation) opt in by filling out
+ * driver_info.xsk_ops. usbnet.c provides the generic xsk pool binding
+ * (ndo_bpf), persistent UMEM DMA mapping, and USB SG-URB submission /
+ * completion plumbing; the minidriver only describes its own framing
+ * format.
+ */
+struct usbnet_xsk_limits {
+	/* max number of AF_XDP TX descriptors batched into one USB
+	 * transfer/completion (e.g. NCM's tx_max_datagrams). */
+	unsigned int max_frames;
+	/* max bytes needed for the framing header(s) built by tx_build()
+	 * (e.g. NTH + NDP for max_frames datagrams). */
+	unsigned int max_hdr_size;
+	/* max bytes needed for a single alignment padding run between (or
+	 * after) datagrams. */
+	unsigned int max_pad_size;
+	/* soft byte budget for one aggregated USB transfer (e.g. NCM's
+	 * tx_curr_size); used to decide when to stop batching more
+	 * descriptors into the current transfer. A single descriptor is
+	 * always sent even if it alone exceeds this budget. */
+	unsigned int max_tx_size;
+};
+
+/* Scratch buffers/scatterlist handed to tx_build() by usbnet.c. hdr_buf and
+ * pad_buf are DMA-coherent (no cache sync needed when written/read).
+ * pad_buf is zero-filled and read-only (shared across concurrent in-flight
+ * URBs); hdr_buf is private to this call and safe to overwrite freely.
+ */
+struct usbnet_xsk_tx_ctx {
+	struct scatterlist	*sg;
+	unsigned int		sg_max;
+	void			*hdr_buf;
+	dma_addr_t		hdr_buf_dma;
+	unsigned int		hdr_buf_size;
+	void			*pad_buf;
+	dma_addr_t		pad_buf_dma;
+	unsigned int		pad_buf_size;
+};
+
+struct usbnet_xsk_ops {
+	/* report batching limits; called once when the xsk pool is bound */
+	int (*get_limits)(struct usbnet *dev, struct usbnet_xsk_limits *lim);
+
+	/* Build one USB transfer out of up to @n descriptors already peeked
+	 * from the xsk pool (persistent DMA addresses in @dma, lengths in
+	 * @len, both already synced for device via
+	 * xsk_buff_raw_dma_sync_for_device()). Must fill in up to
+	 * tx->sg_max scatterlist entries (zero-copy for payloads, using
+	 * @dma/@len directly; tx->hdr_buf/tx->pad_buf for framing/padding)
+	 * and return the number of descriptors actually consumed (<= n,
+	 * > 0 on success), the number of sg entries used via *nsg and the
+	 * total transfer length via *total_len. Returns a negative errno
+	 * if not even one descriptor could be built (e.g. n == 0).
+	 *
+	 * @pages/@offs give the struct page and in-page offset backing each
+	 * @dma entry (needed to build sg entries with a valid struct page:
+	 * some USB host controllers (e.g. xhci) copy through a "bounce
+	 * buffer" via sg_pcopy_to_buffer() when a TD isn't aligned to the
+	 * endpoint's max packet size, which requires sg_page() to resolve to
+	 * real memory -- a bare dma_addr_t with no page is silently treated
+	 * as a zero-length copy, corrupting the transfer).
+	 */
+	int (*tx_build)(struct usbnet *dev, struct usbnet_xsk_tx_ctx *tx,
+			const dma_addr_t *dma, struct page **pages,
+			const unsigned int *offs, const u32 *len,
+			unsigned int n, unsigned int *nsg,
+			unsigned int *total_len);
+};
 
 /* interface from usbnet core to each USB networking link we handle */
 struct usbnet {
@@ -62,6 +139,28 @@ struct usbnet {
 
 	struct work_struct	kevent;
 	unsigned long		flags;
+
+	/* AF_XDP zero-copy TX (optional, see driver_info->xsk_ops) */
+	struct xsk_buff_pool	*xsk_pool;
+	spinlock_t		xsk_tx_lock;
+	atomic_t		xsk_tx_inflight;
+	struct dma_pool		*xsk_hdr_pool;
+	unsigned int		xsk_hdr_size;
+	unsigned int		xsk_max_frames;
+	unsigned int		xsk_sg_max;
+	unsigned int		xsk_max_tx_size;
+	dma_addr_t		*xsk_tx_dma;
+	u32			*xsk_tx_len;
+	struct page		**xsk_tx_page;
+	unsigned int		*xsk_tx_off;
+	bool			xsk_tx_have_spill;
+	dma_addr_t		xsk_tx_spill_dma;
+	u32			xsk_tx_spill_len;
+	struct page		*xsk_tx_spill_page;
+	unsigned int		xsk_tx_spill_off;
+	void			*xsk_pad_buf;
+	dma_addr_t		xsk_pad_buf_dma;
+	unsigned int		xsk_pad_buf_size;
 #		define EVENT_TX_HALT	0
 #		define EVENT_RX_HALT	1
 #		define EVENT_RX_MEMORY	2
@@ -181,6 +280,9 @@ struct driver_info {
 	int		out;		/* tx endpoint */
 
 	unsigned long	data;		/* Misc driver specific data */
+
+	/* optional: AF_XDP zero-copy TX support, see usbnet_xsk_ops above */
+	const struct usbnet_xsk_ops *xsk_ops;
 };
 
 /* Minidrivers are just drivers using the "usbnet" core as a powerful
@@ -266,6 +368,8 @@ extern netdev_tx_t usbnet_start_xmit(struct sk_buff *skb,
 				     struct net_device *net);
 extern void usbnet_tx_timeout(struct net_device *net, unsigned int txqueue);
 extern int usbnet_change_mtu(struct net_device *net, int new_mtu);
+extern int usbnet_ndo_bpf(struct net_device *net, struct netdev_bpf *bpf);
+extern int usbnet_xsk_wakeup(struct net_device *net, u32 queue_id, u32 flags);
 
 extern int usbnet_get_endpoints(struct usbnet *, struct usb_interface *);
 extern int usbnet_get_ethernet_addr(struct usbnet *, int);

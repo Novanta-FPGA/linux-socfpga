@@ -815,6 +815,8 @@ static const struct net_device_ops cdc_ncm_netdev_ops = {
 	.ndo_change_mtu	     = cdc_ncm_change_mtu,
 	.ndo_set_mac_address = eth_mac_addr,
 	.ndo_validate_addr   = eth_validate_addr,
+	.ndo_bpf	     = usbnet_ndo_bpf,
+	.ndo_xsk_wakeup	     = usbnet_xsk_wakeup,
 };
 
 int cdc_ncm_bind_common(struct usbnet *dev, struct usb_interface *intf, u8 data_altsetting, int drvflags)
@@ -1910,6 +1912,166 @@ static void cdc_ncm_update_filter(struct usbnet *dev)
 		usbnet_cdc_update_filter(dev);
 }
 
+/* AF_XDP zero-copy TX support. This is a separate, xsk-only path that
+ * builds NTBs directly out of descriptors already peeked from the xsk
+ * pool by usbnet.c; it does not touch/share state with the regular
+ * skb-based cdc_ncm_fill_tx_frame()/cdc_ncm_tx_fixup() path other than
+ * ctx->tx_seq (protected by ctx->mtx, as usual) and the read-only
+ * negotiated NTB parameters in ctx.
+ *
+ * Unlike the regular path, this does not implement CDC_NCM_FLAG_NDP_TO_END
+ * (Apple-only quirk) nor the trailing short-packet/ZLP-avoidance padding;
+ * neither applies to the "CDC NCM (NO ZLP)" variant used on the hardware
+ * this was written for.
+ */
+static int cdc_ncm_xsk_get_limits(struct usbnet *dev, struct usbnet_xsk_limits *lim)
+{
+	struct cdc_ncm_ctx *ctx = (struct cdc_ncm_ctx *)dev->data[0];
+
+	if (!ctx)
+		return -ENODEV;
+
+	if (ctx->drvflags & CDC_NCM_FLAG_NDP_TO_END)
+		return -EOPNOTSUPP;
+
+	lim->max_frames = ctx->tx_max_datagrams;
+	lim->max_hdr_size = (ctx->is_ndp16 ? sizeof(struct usb_cdc_ncm_nth16) :
+					      sizeof(struct usb_cdc_ncm_nth32)) +
+			    ctx->max_ndp_size;
+	/* worst case single alignment run, per cdc_ncm_align_tail() */
+	lim->max_pad_size = ctx->tx_modulus + ctx->tx_remainder;
+	lim->max_tx_size = ctx->tx_max;
+
+	return 0;
+}
+
+static int cdc_ncm_xsk_tx_build(struct usbnet *dev, struct usbnet_xsk_tx_ctx *tx,
+				 const dma_addr_t *dma, struct page **pages,
+				 const unsigned int *offs, const u32 *len,
+				 unsigned int n, unsigned int *nsg,
+				 unsigned int *total_len)
+{
+	struct cdc_ncm_ctx *ctx = (struct cdc_ncm_ctx *)dev->data[0];
+	unsigned int hdr_len, ndp_len, i, sg_n = 1, offset;
+	u8 *hdr = tx->hdr_buf;
+
+	if (!ctx || n == 0)
+		return -EINVAL;
+	if (n > ctx->tx_max_datagrams)
+		n = ctx->tx_max_datagrams;
+
+	hdr_len = ctx->is_ndp16 ? sizeof(struct usb_cdc_ncm_nth16) :
+				  sizeof(struct usb_cdc_ncm_nth32);
+	ndp_len = ctx->max_ndp_size;
+
+	if (hdr_len + ndp_len > tx->hdr_buf_size)
+		return -EINVAL;
+
+	memset(hdr, 0, hdr_len + ndp_len);
+	offset = hdr_len + ndp_len;
+
+	/* slot 0 is reserved for the header segment (NTH + NDP), covering
+	 * the fixed hdr_len + ndp_len region regardless of how many dpe
+	 * entries end up populated. tx->hdr_buf is DMA-coherent kernel
+	 * memory, so sg_set_buf() (-> virt_to_page()) gives it a real
+	 * struct page; the dma_address is then overridden to the
+	 * already-mapped hdr_buf_dma since URB_NO_TRANSFER_DMA_MAP is set
+	 * (see comment on struct page * usage in usbnet_xsk_tx_drain()).
+	 */
+	sg_set_buf(&tx->sg[0], hdr, hdr_len + ndp_len);
+	sg_dma_address(&tx->sg[0]) = tx->hdr_buf_dma;
+	sg_dma_len(&tx->sg[0]) = hdr_len + ndp_len;
+
+	spin_lock_bh(&ctx->mtx);
+
+	if (ctx->is_ndp16) {
+		struct usb_cdc_ncm_nth16 *nth16 = (void *)hdr;
+		struct usb_cdc_ncm_ndp16 *ndp16 = (void *)(hdr + hdr_len);
+
+		nth16->dwSignature = cpu_to_le32(USB_CDC_NCM_NTH16_SIGN);
+		nth16->wHeaderLength = cpu_to_le16(hdr_len);
+		nth16->wSequence = cpu_to_le16(ctx->tx_seq++);
+		nth16->wNdpIndex = cpu_to_le16(hdr_len);
+
+		ndp16->dwSignature = cpu_to_le32(USB_CDC_NCM_NDP16_NOCRC_SIGN);
+
+		for (i = 0; i < n; i++) {
+			unsigned int pad = ALIGN(offset, ctx->tx_modulus) -
+					    offset + ctx->tx_remainder;
+
+			if (pad) {
+				sg_set_buf(&tx->sg[sg_n], tx->pad_buf, pad);
+				sg_dma_address(&tx->sg[sg_n]) = tx->pad_buf_dma;
+				sg_dma_len(&tx->sg[sg_n]) = pad;
+				sg_n++;
+				offset += pad;
+			}
+
+			ndp16->dpe16[i].wDatagramIndex = cpu_to_le16(offset);
+			ndp16->dpe16[i].wDatagramLength = cpu_to_le16(len[i]);
+
+			sg_set_page(&tx->sg[sg_n], pages[i], len[i], offs[i]);
+			sg_dma_address(&tx->sg[sg_n]) = dma[i];
+			sg_dma_len(&tx->sg[sg_n]) = len[i];
+			sg_n++;
+			offset += len[i];
+		}
+
+		ndp16->wLength = cpu_to_le16(sizeof(*ndp16) +
+					      (n + 1) * sizeof(struct usb_cdc_ncm_dpe16));
+		nth16->wBlockLength = cpu_to_le16(offset);
+	} else {
+		struct usb_cdc_ncm_nth32 *nth32 = (void *)hdr;
+		struct usb_cdc_ncm_ndp32 *ndp32 = (void *)(hdr + hdr_len);
+
+		nth32->dwSignature = cpu_to_le32(USB_CDC_NCM_NTH32_SIGN);
+		nth32->wHeaderLength = cpu_to_le16(hdr_len);
+		nth32->wSequence = cpu_to_le16(ctx->tx_seq++);
+		nth32->dwNdpIndex = cpu_to_le32(hdr_len);
+
+		ndp32->dwSignature = cpu_to_le32(USB_CDC_NCM_NDP32_NOCRC_SIGN);
+
+		for (i = 0; i < n; i++) {
+			unsigned int pad = ALIGN(offset, ctx->tx_modulus) -
+					    offset + ctx->tx_remainder;
+
+			if (pad) {
+				sg_set_buf(&tx->sg[sg_n], tx->pad_buf, pad);
+				sg_dma_address(&tx->sg[sg_n]) = tx->pad_buf_dma;
+				sg_dma_len(&tx->sg[sg_n]) = pad;
+				sg_n++;
+				offset += pad;
+			}
+
+			ndp32->dpe32[i].dwDatagramIndex = cpu_to_le32(offset);
+			ndp32->dpe32[i].dwDatagramLength = cpu_to_le32(len[i]);
+
+			sg_set_page(&tx->sg[sg_n], pages[i], len[i], offs[i]);
+			sg_dma_address(&tx->sg[sg_n]) = dma[i];
+			sg_dma_len(&tx->sg[sg_n]) = len[i];
+			sg_n++;
+			offset += len[i];
+		}
+
+		ndp32->wLength = cpu_to_le16(sizeof(*ndp32) +
+					      (n + 1) * sizeof(struct usb_cdc_ncm_dpe32));
+		nth32->dwBlockLength = cpu_to_le32(offset);
+	}
+
+	spin_unlock_bh(&ctx->mtx);
+
+	sg_mark_end(&tx->sg[sg_n - 1]);
+	*nsg = sg_n;
+	*total_len = offset;
+
+	return n;
+}
+
+static const struct usbnet_xsk_ops cdc_ncm_xsk_ops = {
+	.get_limits = cdc_ncm_xsk_get_limits,
+	.tx_build = cdc_ncm_xsk_tx_build,
+};
+
 static const struct driver_info cdc_ncm_info = {
 	.description = "CDC NCM (NO ZLP)",
 	.flags = FLAG_POINTTOPOINT | FLAG_NO_SETINT | FLAG_MULTI_PACKET
@@ -1921,6 +2083,7 @@ static const struct driver_info cdc_ncm_info = {
 	.rx_fixup = cdc_ncm_rx_fixup,
 	.tx_fixup = cdc_ncm_tx_fixup,
 	.set_rx_mode = cdc_ncm_update_filter,
+	.xsk_ops = &cdc_ncm_xsk_ops,
 };
 
 /* Same as cdc_ncm_info, but with FLAG_SEND_ZLP  */
