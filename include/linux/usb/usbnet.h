@@ -19,6 +19,7 @@
 struct xsk_buff_pool;
 struct dma_pool;
 struct usbnet;
+struct usbnet_xsk_tx_urb_ctx;
 
 /* AF_XDP zero-copy TX support (see usbnet_xsk_*() in usbnet.c).
  *
@@ -143,8 +144,13 @@ struct usbnet {
 	/* AF_XDP zero-copy TX (optional, see driver_info->xsk_ops) */
 	struct xsk_buff_pool	*xsk_pool;
 	spinlock_t		xsk_tx_lock;
+	bool			xsk_tx_draining;
+	bool			xsk_tx_rerun;
 	atomic_t		xsk_tx_inflight;
 	struct dma_pool		*xsk_hdr_pool;
+	struct usbnet_xsk_tx_urb_ctx *xsk_tx_slots;
+	struct page		**xsk_umem_pages;
+	unsigned int		xsk_umem_pages_cnt;
 	unsigned int		xsk_hdr_size;
 	unsigned int		xsk_max_frames;
 	unsigned int		xsk_sg_max;

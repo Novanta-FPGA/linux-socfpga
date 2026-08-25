@@ -75,6 +75,18 @@ static int msg_level = -1;
 module_param (msg_level, int, 0);
 MODULE_PARM_DESC (msg_level, "Override default message level");
 
+/* AF_XDP normally requires the DMA API to transfer ownership of every TX
+ * buffer from the CPU to the device. A non-coherent external producer may
+ * instead clean+invalidate each completed UMEM frame to PoC before publishing
+ * its TX descriptor. Such a producer can opt out of the duplicate DMA sync.
+ * This platform-specific tree defaults to that externally maintained mode;
+ * pass xsk_skip_dma_sync=0 for ordinary CPU-written AF_XDP UMEM.
+ */
+static bool xsk_skip_dma_sync = true;
+module_param(xsk_skip_dma_sync, bool, 0444);
+MODULE_PARM_DESC(xsk_skip_dma_sync,
+		 "Skip AF_XDP TX DMA sync (default Y; requires externally maintained UMEM cache)");
+
 /*-------------------------------------------------------------------------*/
 
 static const char * const usbnet_event_names[] = {
@@ -1702,63 +1714,100 @@ EXPORT_SYMBOL_GPL(usbnet_disconnect);
  */
 #define USBNET_XSK_TX_INFLIGHT_MAX 4
 
-/* per-URB completion context for the zero-copy xsk TX path */
+/* Preallocated per-URB state for the zero-copy xsk TX path. All fields are
+ * stable for the lifetime of a bound pool except pool/n_frames/in_use, which
+ * are protected by dev->xsk_tx_lock. Keeping the URB, SG table and coherent
+ * header removes all allocator traffic from the steady-state TX path.
+ */
 struct usbnet_xsk_tx_urb_ctx {
 	struct usbnet		*dev;
+	struct xsk_buff_pool	*pool;
+	struct urb		*urb;
 	struct scatterlist	*sg;
 	void			*hdr_buf;
 	dma_addr_t		hdr_buf_dma;
 	unsigned int		n_frames;
+	bool			in_use;
 };
 
-static void usbnet_xsk_tx_drain(struct usbnet *dev);
+static void usbnet_xsk_tx_kick(struct usbnet *dev);
+
+static struct usbnet_xsk_tx_urb_ctx *
+usbnet_xsk_tx_slot_get(struct usbnet *dev)
+{
+	struct usbnet_xsk_tx_urb_ctx *ret = NULL;
+	unsigned long flags;
+	unsigned int i;
+
+	spin_lock_irqsave(&dev->xsk_tx_lock, flags);
+	for (i = 0; i < USBNET_XSK_TX_INFLIGHT_MAX; i++) {
+		struct usbnet_xsk_tx_urb_ctx *ctx = &dev->xsk_tx_slots[i];
+
+		if (!ctx->in_use) {
+			ctx->in_use = true;
+			ret = ctx;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&dev->xsk_tx_lock, flags);
+
+	return ret;
+}
+
+static void usbnet_xsk_tx_slot_put(struct usbnet_xsk_tx_urb_ctx *ctx)
+{
+	struct usbnet *dev = ctx->dev;
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->xsk_tx_lock, flags);
+	ctx->n_frames = 0;
+	ctx->pool = NULL;
+	ctx->in_use = false;
+	spin_unlock_irqrestore(&dev->xsk_tx_lock, flags);
+}
 
 static void usbnet_xsk_tx_complete(struct urb *urb)
 {
 	struct usbnet_xsk_tx_urb_ctx *ctx = urb->context;
 	struct usbnet *dev = ctx->dev;
-	unsigned long flags;
+	struct xsk_buff_pool *pool = ctx->pool;
 
 	if (urb->status)
 		netif_dbg(dev, tx_err, dev->net, "xsk tx err %d\n", urb->status);
 
-	xsk_tx_completed(dev->xsk_pool, ctx->n_frames);
+	/* Use the pool captured at submission time. Pool disable deliberately
+	 * clears dev->xsk_pool before waiting for callbacks to finish.
+	 */
+	xsk_tx_completed(pool, ctx->n_frames);
 	usb_autopm_put_interface_async(dev->intf);
 
-	dma_pool_free(dev->xsk_hdr_pool, ctx->hdr_buf, ctx->hdr_buf_dma);
-	kfree(ctx->sg);
-	kfree(ctx);
-	usb_free_urb(urb);
-
+	usbnet_xsk_tx_slot_put(ctx);
 	atomic_dec(&dev->xsk_tx_inflight);
 
-	if (netif_running(dev->net) && dev->xsk_pool) {
-		spin_lock_irqsave(&dev->xsk_tx_lock, flags);
-		usbnet_xsk_tx_drain(dev);
-		spin_unlock_irqrestore(&dev->xsk_tx_lock, flags);
-	}
+	if (netif_running(dev->net) && READ_ONCE(dev->xsk_pool) == pool)
+		usbnet_xsk_tx_kick(dev);
 }
 
-/* Must be called with dev->xsk_tx_lock held. */
-static void usbnet_xsk_tx_drain(struct usbnet *dev)
+/* Only usbnet_xsk_tx_kick() calls this function, and it permits exactly one
+ * drainer at a time. Local IRQs remain enabled while descriptors are consumed,
+ * NCM framing is built and URBs are submitted; completion only takes the lock
+ * briefly to recycle a slot and request another drain pass.
+ */
+static void usbnet_xsk_tx_drain(struct usbnet *dev,
+				struct xsk_buff_pool *pool)
 {
 	const struct usbnet_xsk_ops *xsk_ops = dev->driver_info->xsk_ops;
-	struct xsk_buff_pool *pool = dev->xsk_pool;
-
-	if (!pool)
-		return;
 
 	while (atomic_read(&dev->xsk_tx_inflight) < USBNET_XSK_TX_INFLIGHT_MAX) {
 		struct usbnet_xsk_tx_urb_ctx *ctx;
 		struct usbnet_xsk_tx_ctx tx = { };
 		struct xdp_desc desc;
-		struct scatterlist *sg;
-		struct urb *urb;
 		unsigned int n = 0, nsg = 0, total_len = 0, budget = 0;
 		dma_addr_t dma_addr;
-		void *hdr_buf;
-		dma_addr_t hdr_buf_dma;
 		int ret;
+
+		if (READ_ONCE(dev->xsk_pool) != pool)
+			break;
 
 		if (dev->xsk_tx_have_spill) {
 			dev->xsk_tx_dma[n] = dev->xsk_tx_spill_dma;
@@ -1773,17 +1822,19 @@ static void usbnet_xsk_tx_drain(struct usbnet *dev)
 		while (n < dev->xsk_max_frames) {
 			struct page *page;
 			unsigned int off;
+			unsigned long page_idx;
 			void *va;
 
 			if (!xsk_tx_peek_desc(pool, &desc))
 				break;
 
 			dma_addr = xsk_buff_raw_get_dma(pool, desc.addr);
-			xsk_buff_raw_dma_sync_for_device(pool, dma_addr, desc.len);
+			if (!xsk_skip_dma_sync)
+				xsk_buff_raw_dma_sync_for_device(pool, dma_addr, desc.len);
 
 			/* UMEM is vmap()'d (see xdp_umem_addr_map()), so
-			 * virt_to_page() doesn't apply; resolve the backing
-			 * struct page via the page tables instead. Needed so
+			 * virt_to_page() doesn't apply. The backing pages were
+			 * resolved once when the pool was enabled. Needed so
 			 * sg_page() is valid: some USB host controllers (xhci)
 			 * copy through a bounce buffer via sg_pcopy_to_buffer()
 			 * when a TD isn't aligned to the endpoint's max packet
@@ -1791,7 +1842,14 @@ static void usbnet_xsk_tx_drain(struct usbnet *dev)
 			 * transfer) if the sg entry has no real page behind it.
 			 */
 			va = xsk_buff_raw_get_data(pool, desc.addr);
-			page = vmalloc_to_page(va);
+			page_idx = ((unsigned long)va -
+				    (unsigned long)pool->addrs) >> PAGE_SHIFT;
+			if (WARN_ON_ONCE(page_idx >= dev->xsk_umem_pages_cnt)) {
+				xsk_tx_completed(pool, 1);
+				dev->net->stats.tx_dropped++;
+				continue;
+			}
+			page = dev->xsk_umem_pages[page_idx];
 			off = offset_in_page(va);
 
 			if (n > 0 && budget + desc.len > dev->xsk_max_tx_size) {
@@ -1819,26 +1877,24 @@ static void usbnet_xsk_tx_drain(struct usbnet *dev)
 			break;
 		}
 
-		sg = kmalloc_array(dev->xsk_sg_max, sizeof(*sg), GFP_ATOMIC);
-		if (!sg) {
+		/* A successful peek means completion-driven refill can make
+		 * progress without another sendto()/ndo_xsk_wakeup() call.
+		 */
+		xsk_clear_tx_need_wakeup(pool);
+
+		ctx = usbnet_xsk_tx_slot_get(dev);
+		if (WARN_ON_ONCE(!ctx)) {
 			xsk_tx_completed(pool, n);
 			dev->net->stats.tx_dropped += n;
+			xsk_set_tx_need_wakeup(pool);
 			break;
 		}
-		sg_init_table(sg, dev->xsk_sg_max);
+		sg_init_table(ctx->sg, dev->xsk_sg_max);
 
-		hdr_buf = dma_pool_alloc(dev->xsk_hdr_pool, GFP_ATOMIC, &hdr_buf_dma);
-		if (!hdr_buf) {
-			kfree(sg);
-			xsk_tx_completed(pool, n);
-			dev->net->stats.tx_dropped += n;
-			break;
-		}
-
-		tx.sg = sg;
+		tx.sg = ctx->sg;
 		tx.sg_max = dev->xsk_sg_max;
-		tx.hdr_buf = hdr_buf;
-		tx.hdr_buf_dma = hdr_buf_dma;
+		tx.hdr_buf = ctx->hdr_buf;
+		tx.hdr_buf_dma = ctx->hdr_buf_dma;
 		tx.hdr_buf_size = dev->xsk_hdr_size;
 		tx.pad_buf = dev->xsk_pad_buf;
 		tx.pad_buf_dma = dev->xsk_pad_buf_dma;
@@ -1848,82 +1904,94 @@ static void usbnet_xsk_tx_drain(struct usbnet *dev)
 					 dev->xsk_tx_off, dev->xsk_tx_len,
 					 n, &nsg, &total_len);
 		if (ret <= 0) {
-			dma_pool_free(dev->xsk_hdr_pool, hdr_buf, hdr_buf_dma);
-			kfree(sg);
+			usbnet_xsk_tx_slot_put(ctx);
 			xsk_tx_completed(pool, n);
 			dev->net->stats.tx_dropped += n;
+			xsk_set_tx_need_wakeup(pool);
 			break;
 		}
 		n = ret;
 
-		ctx = kmalloc(sizeof(*ctx), GFP_ATOMIC);
-		urb = usb_alloc_urb(0, GFP_ATOMIC);
-		if (!ctx || !urb) {
-			kfree(ctx);
-			usb_free_urb(urb);
-			dma_pool_free(dev->xsk_hdr_pool, hdr_buf, hdr_buf_dma);
-			kfree(sg);
-			xsk_tx_completed(pool, n);
-			dev->net->stats.tx_dropped += n;
-			break;
-		}
-
-		ctx->dev = dev;
-		ctx->sg = sg;
-		ctx->hdr_buf = hdr_buf;
-		ctx->hdr_buf_dma = hdr_buf_dma;
+		ctx->pool = pool;
 		ctx->n_frames = n;
 
-		usb_fill_bulk_urb(urb, dev->udev, dev->out, NULL, total_len,
-				   usbnet_xsk_tx_complete, ctx);
-		urb->sg = sg;
-		urb->num_sgs = nsg;
-		urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+		usb_fill_bulk_urb(ctx->urb, dev->udev, dev->out, NULL, total_len,
+				  usbnet_xsk_tx_complete, ctx);
+		ctx->urb->sg = ctx->sg;
+		ctx->urb->num_sgs = nsg;
+		ctx->urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
 
 		if (usb_autopm_get_interface_async(dev->intf)) {
-			usb_free_urb(urb);
-			kfree(ctx);
-			dma_pool_free(dev->xsk_hdr_pool, hdr_buf, hdr_buf_dma);
-			kfree(sg);
+			usbnet_xsk_tx_slot_put(ctx);
 			xsk_tx_completed(pool, n);
 			dev->net->stats.tx_dropped += n;
+			xsk_set_tx_need_wakeup(pool);
 			break;
 		}
 
-		ret = usb_submit_urb(urb, GFP_ATOMIC);
+		/* Account for the URB before submission: a host controller may
+		 * invoke completion on another CPU immediately after submit.
+		 */
+		atomic_inc(&dev->xsk_tx_inflight);
+		ret = usb_submit_urb(ctx->urb, GFP_ATOMIC);
 		if (ret) {
 			netif_dbg(dev, tx_err, dev->net,
 				  "xsk tx: submit urb err %d\n", ret);
+			atomic_dec(&dev->xsk_tx_inflight);
 			usb_autopm_put_interface_async(dev->intf);
-			usb_free_urb(urb);
-			kfree(ctx);
-			dma_pool_free(dev->xsk_hdr_pool, hdr_buf, hdr_buf_dma);
-			kfree(sg);
+			usbnet_xsk_tx_slot_put(ctx);
 			xsk_tx_completed(pool, n);
 			dev->net->stats.tx_dropped += n;
+			xsk_set_tx_need_wakeup(pool);
 			break;
 		}
+	}
+}
 
-		/* Ownership of urb now belongs to the USB core until
-		 * usbnet_xsk_tx_complete() runs; it calls usb_free_urb().
-		 * Freeing it here too would be a double-free (this was a
-		 * real bug found via a hardware use-after-free/panic).
-		 */
-		atomic_inc(&dev->xsk_tx_inflight);
+/* Serialize drainers without keeping local IRQs disabled across the expensive
+ * descriptor/framing/USB submission path. A concurrent wakeup or completion
+ * requests another pass instead of entering the drain recursively.
+ */
+static void usbnet_xsk_tx_kick(struct usbnet *dev)
+{
+	struct xsk_buff_pool *pool;
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->xsk_tx_lock, flags);
+	if (dev->xsk_tx_draining) {
+		dev->xsk_tx_rerun = true;
+		spin_unlock_irqrestore(&dev->xsk_tx_lock, flags);
+		return;
+	}
+	dev->xsk_tx_draining = true;
+	spin_unlock_irqrestore(&dev->xsk_tx_lock, flags);
+
+	for (;;) {
+		pool = READ_ONCE(dev->xsk_pool);
+		if (pool)
+			usbnet_xsk_tx_drain(dev, pool);
+
+		spin_lock_irqsave(&dev->xsk_tx_lock, flags);
+		if (dev->xsk_tx_rerun && dev->xsk_pool) {
+			dev->xsk_tx_rerun = false;
+			spin_unlock_irqrestore(&dev->xsk_tx_lock, flags);
+			continue;
+		}
+		dev->xsk_tx_rerun = false;
+		dev->xsk_tx_draining = false;
+		spin_unlock_irqrestore(&dev->xsk_tx_lock, flags);
+		break;
 	}
 }
 
 int usbnet_xsk_wakeup(struct net_device *net, u32 queue_id, u32 flags)
 {
 	struct usbnet *dev = netdev_priv(net);
-	unsigned long lock_flags;
 
-	if (!dev->xsk_pool || queue_id != 0)
+	if (!READ_ONCE(dev->xsk_pool) || queue_id != 0)
 		return -EINVAL;
 
-	spin_lock_irqsave(&dev->xsk_tx_lock, lock_flags);
-	usbnet_xsk_tx_drain(dev);
-	spin_unlock_irqrestore(&dev->xsk_tx_lock, lock_flags);
+	usbnet_xsk_tx_kick(dev);
 
 	return 0;
 }
@@ -1932,6 +2000,9 @@ static void usbnet_xsk_pool_disable(struct usbnet *dev)
 {
 	struct xsk_buff_pool *pool = dev->xsk_pool;
 	unsigned long flags;
+	unsigned int i;
+	bool draining;
+	bool have_spill;
 
 	if (!pool)
 		return;
@@ -1940,14 +2011,46 @@ static void usbnet_xsk_pool_disable(struct usbnet *dev)
 	dev->xsk_pool = NULL;
 	spin_unlock_irqrestore(&dev->xsk_tx_lock, flags);
 
+	/* A drainer that observed the old pool may finish its current URB, but
+	 * cannot start another one after seeing xsk_pool become NULL.
+	 */
+	do {
+		spin_lock_irqsave(&dev->xsk_tx_lock, flags);
+		draining = dev->xsk_tx_draining;
+		spin_unlock_irqrestore(&dev->xsk_tx_lock, flags);
+		if (draining)
+			usleep_range(1000, 2000);
+	} while (draining);
+
+	have_spill = dev->xsk_tx_have_spill;
+	dev->xsk_tx_have_spill = false;
+
+	if (have_spill)
+		xsk_tx_completed(pool, 1);
+
 	/* wait out any zero-copy URBs still in flight before tearing down
 	 * the persistent DMA mapping and scratch buffers they reference.
 	 * Called from process context (ndo_bpf), so sleeping is fine.
 	 */
 	while (atomic_read(&dev->xsk_tx_inflight))
-		msleep(1);
+		usleep_range(1000, 2000);
 
+	xsk_clear_tx_need_wakeup(pool);
 	xsk_pool_dma_unmap(pool, 0);
+	kvfree(dev->xsk_umem_pages);
+	dev->xsk_umem_pages = NULL;
+	dev->xsk_umem_pages_cnt = 0;
+
+	for (i = 0; i < USBNET_XSK_TX_INFLIGHT_MAX; i++) {
+		struct usbnet_xsk_tx_urb_ctx *ctx = &dev->xsk_tx_slots[i];
+
+		usb_free_urb(ctx->urb);
+		kfree(ctx->sg);
+		dma_pool_free(dev->xsk_hdr_pool, ctx->hdr_buf,
+			      ctx->hdr_buf_dma);
+	}
+	kfree(dev->xsk_tx_slots);
+	dev->xsk_tx_slots = NULL;
 
 	dma_pool_destroy(dev->xsk_hdr_pool);
 	dev->xsk_hdr_pool = NULL;
@@ -1970,7 +2073,6 @@ static void usbnet_xsk_pool_disable(struct usbnet *dev)
 	dev->xsk_max_frames = 0;
 	dev->xsk_sg_max = 0;
 	dev->xsk_max_tx_size = 0;
-	dev->xsk_tx_have_spill = false;
 }
 
 static int usbnet_xsk_pool_enable(struct usbnet *dev, struct xsk_buff_pool *pool,
@@ -1979,6 +2081,7 @@ static int usbnet_xsk_pool_enable(struct usbnet *dev, struct xsk_buff_pool *pool
 	const struct usbnet_xsk_ops *xsk_ops = dev->driver_info->xsk_ops;
 	struct usbnet_xsk_limits lim = { };
 	struct device *dma_dev = dev->udev->bus->sysdev;
+	unsigned int i, j;
 	int err;
 
 	if (!xsk_ops || !xsk_ops->get_limits || !xsk_ops->tx_build)
@@ -1998,11 +2101,32 @@ static int usbnet_xsk_pool_enable(struct usbnet *dev, struct xsk_buff_pool *pool
 	if (err)
 		return err;
 
+	/* xdp_umem_addr_map() exposes the pinned UMEM through one vmap. Resolve
+	 * that vmap once here instead of calling vmalloc_to_page() per packet.
+	 * The page pointers remain valid until xsk_pool_dma_unmap().
+	 */
+	dev->xsk_umem_pages_cnt = pool->dma_pages_cnt;
+	dev->xsk_umem_pages = kvmalloc_array(dev->xsk_umem_pages_cnt,
+					     sizeof(*dev->xsk_umem_pages),
+					     GFP_KERNEL);
+	if (!dev->xsk_umem_pages) {
+		err = -ENOMEM;
+		goto err_unmap;
+	}
+	for (i = 0; i < dev->xsk_umem_pages_cnt; i++) {
+		dev->xsk_umem_pages[i] =
+			vmalloc_to_page((u8 *)pool->addrs + (i * PAGE_SIZE));
+		if (!dev->xsk_umem_pages[i]) {
+			err = -EFAULT;
+			goto err_pages;
+		}
+	}
+
 	dev->xsk_hdr_pool = dma_pool_create(dev->net->name, dma_dev,
 					     lim.max_hdr_size, 4, 0);
 	if (!dev->xsk_hdr_pool) {
 		err = -ENOMEM;
-		goto err_unmap;
+		goto err_pages;
 	}
 	dev->xsk_hdr_size = lim.max_hdr_size;
 
@@ -2033,9 +2157,33 @@ static int usbnet_xsk_pool_enable(struct usbnet *dev, struct xsk_buff_pool *pool
 
 	/* header + (payload + pad) per frame + trailing pad/short-packet */
 	dev->xsk_sg_max = 1 + lim.max_frames * 2 + 1;
+	dev->xsk_tx_slots = kcalloc(USBNET_XSK_TX_INFLIGHT_MAX,
+				    sizeof(*dev->xsk_tx_slots), GFP_KERNEL);
+	if (!dev->xsk_tx_slots) {
+		err = -ENOMEM;
+		goto err_pad;
+	}
+
+	for (i = 0; i < USBNET_XSK_TX_INFLIGHT_MAX; i++) {
+		struct usbnet_xsk_tx_urb_ctx *ctx = &dev->xsk_tx_slots[i];
+
+		ctx->dev = dev;
+		ctx->sg = kmalloc_array(dev->xsk_sg_max, sizeof(*ctx->sg),
+					GFP_KERNEL);
+		ctx->urb = usb_alloc_urb(0, GFP_KERNEL);
+		ctx->hdr_buf = dma_pool_alloc(dev->xsk_hdr_pool, GFP_KERNEL,
+					      &ctx->hdr_buf_dma);
+		if (!ctx->sg || !ctx->urb || !ctx->hdr_buf) {
+			err = -ENOMEM;
+			goto err_slots;
+		}
+	}
+
 	dev->xsk_max_frames = lim.max_frames;
 	dev->xsk_max_tx_size = lim.max_tx_size;
 	dev->xsk_tx_have_spill = false;
+	dev->xsk_tx_draining = false;
+	dev->xsk_tx_rerun = false;
 	atomic_set(&dev->xsk_tx_inflight, 0);
 
 	/* xsk_pool must be set last: it's what enables ndo_xsk_wakeup */
@@ -2043,6 +2191,24 @@ static int usbnet_xsk_pool_enable(struct usbnet *dev, struct xsk_buff_pool *pool
 
 	return 0;
 
+err_slots:
+	for (j = 0; j <= i; j++) {
+		struct usbnet_xsk_tx_urb_ctx *ctx = &dev->xsk_tx_slots[j];
+
+		usb_free_urb(ctx->urb);
+		kfree(ctx->sg);
+		if (ctx->hdr_buf)
+			dma_pool_free(dev->xsk_hdr_pool, ctx->hdr_buf,
+				      ctx->hdr_buf_dma);
+	}
+	kfree(dev->xsk_tx_slots);
+	dev->xsk_tx_slots = NULL;
+err_pad:
+	if (dev->xsk_pad_buf)
+		dma_free_coherent(dma_dev, dev->xsk_pad_buf_size,
+				  dev->xsk_pad_buf, dev->xsk_pad_buf_dma);
+	dev->xsk_pad_buf = NULL;
+	dev->xsk_pad_buf_size = 0;
 err_arrays:
 	kfree(dev->xsk_tx_dma);
 	kfree(dev->xsk_tx_len);
@@ -2054,6 +2220,10 @@ err_arrays:
 	dev->xsk_tx_off = NULL;
 	dma_pool_destroy(dev->xsk_hdr_pool);
 	dev->xsk_hdr_pool = NULL;
+err_pages:
+	kvfree(dev->xsk_umem_pages);
+	dev->xsk_umem_pages = NULL;
+	dev->xsk_umem_pages_cnt = 0;
 err_unmap:
 	xsk_pool_dma_unmap(pool, 0);
 	return err;

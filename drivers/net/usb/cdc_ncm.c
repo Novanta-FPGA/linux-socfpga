@@ -1927,6 +1927,7 @@ static void cdc_ncm_update_filter(struct usbnet *dev)
 static int cdc_ncm_xsk_get_limits(struct usbnet *dev, struct usbnet_xsk_limits *lim)
 {
 	struct cdc_ncm_ctx *ctx = (struct cdc_ncm_ctx *)dev->data[0];
+	u32 max_ntb, overhead;
 
 	if (!ctx)
 		return -ENODEV;
@@ -1940,7 +1941,18 @@ static int cdc_ncm_xsk_get_limits(struct usbnet *dev, struct usbnet_xsk_limits *
 			    ctx->max_ndp_size;
 	/* worst case single alignment run, per cdc_ncm_align_tail() */
 	lim->max_pad_size = ctx->tx_modulus + ctx->tx_remainder;
-	lim->max_tx_size = ctx->tx_max;
+	/* The regular skb path starts conservatively and exposes tx_max through
+	 * sysfs. AF_XDP is throughput-oriented and can safely aggregate up to
+	 * the maximum NTB size advertised by the device. Reserve worst-case
+	 * framing/alignment bytes because max_tx_size accounts for payload only.
+	 */
+	max_ntb = cdc_ncm_check_tx_max(dev, U32_MAX);
+	if (ctx->is_ndp16)
+		max_ntb = min_t(u32, max_ntb, U16_MAX);
+	overhead = lim->max_hdr_size + lim->max_frames * lim->max_pad_size;
+	if (overhead >= max_ntb)
+		return -EINVAL;
+	lim->max_tx_size = max_ntb - overhead;
 
 	return 0;
 }
