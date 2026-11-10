@@ -60,15 +60,22 @@
 				resetvalue = <7>;				
 		};
 		
+		/*
+		 * mSGDMA with the descriptor prefetcher: dispatcher CSR and
+		 * prefetcher CSR, no descriptor or response port. The kernel
+		 * altera-msgdma driver has no prefetcher support, so this node
+		 * does not use its compatible; msgdma_start_rtp drives the core
+		 * through UIO (voip_example/scripts/msgdma_start.sh binds
+		 * uio_pdrv_genirq to 28000400.dma). The interrupt comes from
+		 * the prefetcher.
+		 */
 		msgdma_0: dma@28000400 {
-				compatible = "altr,socfpga-msgdma";
-				reg = <0x28000400 0x20>,   /* CSR */
-				      <0x28000420 0x20>,   /* Descriptor slave (extended, 32 B) */
-				      <0x28000440 0x08>;   /* Response slave */
-				reg-names = "csr", "desc", "resp";
+				compatible = "altr,socfpga-msgdma-prefetcher";
+				reg = <0x28000400 0x20>,   /* CSR (dispatcher) */
+				      <0x28000420 0x20>;   /* Descriptor prefetcher CSR */
+				reg-names = "csr", "prefetcher";
 				interrupt-parent = <&intc>;
 				interrupts = <0 19 4>;
-				#dma-cells = <1>;
 		};
 
 		led_pio3: gpio@28000060 {
